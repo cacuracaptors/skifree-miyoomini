@@ -98,6 +98,7 @@ int main(int argc, char* argv[]) {
                     mouseY = event.motion.y;
                     handleMouseMoveMessage(mouseX, mouseY);
                 }
+                break;
             case SDL_KEYDOWN:
                 handleKeydownMessage(&event);
                 if (event.key.keysym.sym == SDLK_F10) {
@@ -108,6 +109,7 @@ int main(int argc, char* argv[]) {
                 if (inputEnabled != 0) {
                     handleMouseClick();
                 }
+                break;
             }
         }
 
@@ -3548,6 +3550,12 @@ void handleKeydownMessage(SDL_Event* e) {
                     playerActor->verticalVelocityMaybe = playerActor->verticalVelocityMaybe + -4;
                 }
             }
+            break;
+
+            /* Speed Boost */
+        case SDLK_f:
+            isTurboMode = !isTurboMode;
+            break;
         }
     }
 
