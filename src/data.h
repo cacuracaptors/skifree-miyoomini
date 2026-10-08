@@ -5,7 +5,6 @@
 #ifndef SKIFREE_DECOMP_DATA_H
 #define SKIFREE_DECOMP_DATA_H
 
-#include <SDL2/SDL_mixer.h>
 
 char s_assertErrorFormat[] = "%s line %u";
 char s_Assertion_Failed_0040c0a8[] = "Assertion Failed";
@@ -441,7 +440,6 @@ SDL_Texture* smallTextureAtlas;
 SDL_Texture* statusWindowTexture;
 SDL_Surface* statusWindowSurface;
 
-SDL_Texture *CursorTexture;
 
 SDL_TimerID timer_id;
 
@@ -483,22 +481,8 @@ HDC statusWindowDC;
 //Sound sound_7;
 //Sound sound_8;
 //Sound sound_9;
-Mix_Chunk *piddle;
-Mix_Chunk *gobble;
-Mix_Chunk *jump;
-Mix_Chunk *land;
-Mix_Chunk *ooh;
-Mix_Chunk *ouch;
-Mix_Chunk *snowboard;
-Mix_Chunk *step;
-Mix_Chunk *whoosh;
-Mix_Chunk *woof;
-Mix_Chunk *ding;
-Mix_Chunk *buzz;
-Mix_Chunk *grind;
 // LPCTSTR statusWindowNameStrPtr;
 // HGDIOBJ statusWindowFont;
-TTF_Font* statusWindowFont;
 short textLineHeight;
 short statusWindowHeight;
 short statusWindowTotalTextWidth;

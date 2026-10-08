@@ -8,17 +8,168 @@
 #include "data.h"
 #include "embedded_resources.h"
 #include "resource.h"
-#include <SDL2/SDL_image.h>
-#include <SDL2/SDL_mixer.h>
+#include "oemfont.h"
 #include <stdio.h>
+#include <time.h>
+#include <unistd.h> /* sync(), read() */
+#include <fcntl.h>
+#include <linux/input.h>
 #include <getopt.h>
 
 #define ski_assert(exp, line) (void)((exp) || (assertFailed(sourceFilename, line), 0)) // TODO remove need for src param.
 
 static int fullscreen;
 
-int mouseX = 0;
-int mouseY = 0;
+// MIYOO-PORT-LOTE1
+/* Miyoo Mini port */
+#define GAME_TICK_MS 40         /* SetTimer(hSkiMainWnd, 0x29a, 40, ...) in the original */
+#define KEY_REPEAT_DELAY_MS 500 /* Windows default keyboard repeat delay */
+#define KEY_REPEAT_RATE_MS 33   /* Windows default repeat rate (~30 per second) */
+
+static int needPresent = 0;
+static SDL_Surface* pausedSurface = NULL;
+/* The whole frame is drawn into screenSurface and sent to the display in one
+   piece per frame, as the Pinball port does: this device's renderer limits
+   textures to 640x480, and the sheet of small sprites is taller than that. */
+static SDL_Surface* screenSurface = NULL;
+static SDL_Texture* screenTexture = NULL;
+
+/* 60 frames per second (Menu+Start switches to the original 25 and back;
+   saved in framerate.cfg). The game still runs on the original 40 ms tick;
+   between two ticks every object is drawn part of the way from where it was
+   at the previous tick to where it is now. Only drawing changes, never the
+   game. */
+#define FRAMERATE_FILE "framerate.cfg"
+static int smooth60 = 1;
+static SDL_Surface* noticeSurface = NULL; /* "Frame rate: ..." for a moment */
+static Uint32 noticeUntil = 0;
+static void setSmooth60(int on, int showNotice);
+static void loadSmooth60(void);
+#define FRAME_60_MS3 50          /* 1/60 s, in thirds of a millisecond */
+#define INTERP_MAX_JUMP 128      /* larger moves (new game...) are not smoothed */
+static Uint32 nextFrame3 = 0;    /* next frame, in thirds of a millisecond */
+static int interpAlpha256 = 256; /* 0 = previous tick ... 256 = current tick */
+static short interpPrevX[NUM_ACTORS];
+static short interpPrevY[NUM_ACTORS];
+static unsigned char interpValid[NUM_ACTORS];
+
+/* High Scores box (see hsDraw) */
+static int hsOpen = 0;
+static void hsKey(SDL_Keycode sym);
+static void hsOpenViewer(void);
+static void hsDraw(SDL_Surface* dst);
+
+/* where each object is on screen, relative to the skier, before a tick */
+static void interpSnapshot(void) {
+    Actor* a;
+    for (a = actorListPtr; a != NULL; a = a->next) {
+        int i = (int)(a - actors);
+        if (i >= 0 && i < NUM_ACTORS) {
+            interpPrevX[i] = (short)(a->xPosMaybe - (short)playerX);
+            interpPrevY[i] = (short)(a->yPosMaybe - playerY - a->isInAir);
+            interpValid[i] = 1;
+        }
+    }
+}
+
+/* how far from its current place an object is drawn in this frame */
+static void interpOffset(Actor* a, int* dx, int* dy) {
+    int i = (int)(a - actors);
+    short ox, oy;
+
+    *dx = 0;
+    *dy = 0;
+    if (interpAlpha256 >= 256 || i < 0 || i >= NUM_ACTORS || !interpValid[i]) {
+        return;
+    }
+    ox = (short)(interpPrevX[i] - (short)(a->xPosMaybe - (short)playerX));
+    oy = (short)(interpPrevY[i] - (short)(a->yPosMaybe - playerY - a->isInAir));
+    if (ox > INTERP_MAX_JUMP || ox < -INTERP_MAX_JUMP || oy > INTERP_MAX_JUMP || oy < -INTERP_MAX_JUMP) {
+        return;
+    }
+    *dx = ox * (256 - interpAlpha256) / 256;
+    *dy = oy * (256 - interpAlpha256) / 256;
+}
+
+static void paintSmoothFrame(Uint32 now) {
+    int a = (int)((now - currentTickCount) * 256 / GAME_TICK_MS);
+    interpAlpha256 = a < 0 ? 0 : (a > 256 ? 256 : a);
+    mainWindowPaint(hSkiMainWnd);
+    interpAlpha256 = 256;
+}
+static SDL_Keycode repeatKey = 0;
+static Uint32 repeatAt = 0;
+
+/* Miyoo Mini buttons -> the original controls, as in the PortMaster port:
+   D-pad = arrow keys, A = down-right (PgDn), Y = down-left (End),
+   L2 = face left (Home), R2 = face right (PgUp), X = slight jump (Insert),
+   B/R1 = jump (a mouse click), L1 = speed boost (F), Select = new game (F2),
+   Start = pause (F3).
+   Menu (quit) and the Menu combos (Menu+Start = frame rate, Menu+Select =
+   High Scores) are handled in the main loop. */
+#define KEY_MOUSE_JUMP SDLK_F12 /* stands for a mouse click */
+static SDL_Keycode miyooMapKey(SDL_Keycode sym) {
+    switch (sym) {
+    case SDLK_SPACE:     return SDLK_PAGEDOWN;  /* A */
+    case SDLK_LALT:      return SDLK_END;       /* Y */
+    case SDLK_TAB:       return SDLK_HOME;      /* L2 */
+    case SDLK_BACKSPACE: return SDLK_PAGEUP;    /* R2 */
+    case SDLK_LSHIFT:    return SDLK_INSERT;    /* X */
+    case SDLK_LCTRL:     return KEY_MOUSE_JUMP; /* B */
+    case SDLK_t:         return KEY_MOUSE_JUMP; /* R1 */
+    case SDLK_e:         return SDLK_f;         /* L1 */
+    case SDLK_RCTRL:     return SDLK_F2;        /* Select */
+    case SDLK_RETURN:    return SDLK_F3;        /* Start */
+    default:             return sym;
+    }
+}
+
+/* Menu combos. The Menu key quits when released, unless another button was
+   pressed while it was held (Menu+Select, Menu+Start, the OnionOS Menu+Power
+   screenshot...). Power and the volume keys never reach SDL on this device,
+   so the key devices are also read directly (reading them does not take the
+   keys away from SDL or OnionOS). Same as the Pinball port. */
+static int menuCombo = 0;
+
+/* returns 1 if a button other than Menu was pressed since the last call */
+static int menuOtherKeyPressed(void) {
+    static int fds[10];
+    static int opened = 0;
+    struct input_event ev;
+    int i, pressed = 0;
+
+    if (!opened) {
+        opened = 1;
+        for (i = 0; i < 10; i++) {
+            char path[32];
+            snprintf(path, sizeof(path), "/dev/input/event%d", i);
+            fds[i] = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        }
+    }
+    for (i = 0; i < 10; i++) {
+        if (fds[i] < 0) {
+            continue;
+        }
+        while (read(fds[i], &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
+            if (ev.type == EV_KEY && ev.value == 1 && ev.code != KEY_ESC) {
+                pressed = 1;
+            }
+        }
+    }
+    return pressed;
+}
+
+/* Keys that repeat while held, as WM_KEYDOWN does on Windows */
+static int isRepeatableKey(SDL_Keycode sym) {
+    switch (sym) {
+    case SDLK_LEFT: case SDLK_RIGHT: case SDLK_UP: case SDLK_DOWN:
+    case SDLK_HOME: case SDLK_PAGEUP: case SDLK_END: case SDLK_PAGEDOWN:
+    case SDLK_INSERT:
+        return 1;
+    default:
+        return 0;
+    }
+}
 
 // int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
 int main(int argc, char* argv[]) {
@@ -34,17 +185,14 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_AUDIO) < 0) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) < 0) {
         printf("failed to init\n");
         return 1;
     }
 
-    if(Mix_OpenAudio(44100, AUDIO_S16SYS, 2, 2048) < 0) {
-        printf("Mix_OpenAudio: %s\n", Mix_GetError());
-        return FALSE;
-    }
-
-    TTF_Init();
+    /* Miyoo Mini port: no sound, as in the original game (the sound effects
+       were an addition of the SDL port) */
+    isSoundDisabled = 1;
 
     // todo
     // iVar1 = strcmp(lpCmdLine, s_nosound_0040c0fc);
@@ -79,11 +227,28 @@ int main(int argc, char* argv[]) {
     // }
 
     paintStatusWindow(NULL);
+    loadSmooth60();
+    needPresent = 1;
 
+    /* Miyoo Mini port: the original is driven by a 40 ms Windows timer and
+       draws when it fires. Instead of drawing the screen in a busy loop, the
+       program sleeps until the next tick (or key repeat), saving battery.
+       Like WM_TIMER, a late tick is not made up for. */
     int is_running = 1;
-    int last_timer = SDL_GetTicks();
+    Uint32 nextTick = SDL_GetTicks() + GAME_TICK_MS;
     while (is_running) {
-        SDL_Delay(1);
+        Uint32 now = SDL_GetTicks();
+        Uint32 wakeAt = isGameTimerRunning ? nextTick : now + 20; /* paused: read the buttons 50x/s */
+        if (repeatKey != 0 && (Sint32)(repeatAt - wakeAt) < 0) {
+            wakeAt = repeatAt;
+        }
+        if (smooth60 && isGameTimerRunning && (Sint32)((nextFrame3 + 2) / 3 - wakeAt) < 0) {
+            wakeAt = (nextFrame3 + 2) / 3;
+        }
+        if ((Sint32)(wakeAt - now) > 0) {
+            SDL_Delay(wakeAt - now);
+        }
+
         while (SDL_PollEvent(&event)) {
             switch (event.type) {
             case SDL_QUIT:
@@ -91,34 +256,128 @@ int main(int argc, char* argv[]) {
                 break;
             case SDL_WINDOWEVENT:
                 HandleWindowMessage(&event);
-                break;
-            case SDL_MOUSEMOTION:
-                if (inputEnabled != 0) {
-                    mouseX = event.motion.x;
-                    mouseY = event.motion.y;
-                    handleMouseMoveMessage(mouseX, mouseY);
-                }
+                needPresent = 1;
                 break;
             case SDL_KEYDOWN:
+                if (event.key.repeat) {
+                    break; /* repeat is done below, with the Windows timings */
+                }
+                if (event.key.keysym.sym == SDLK_ESCAPE) {
+                    /* Menu: quits when released (see SDL_KEYUP) */
+                    menuOtherKeyPressed(); /* forget older presses */
+                    menuCombo = 0;
+                    break;
+                }
+                if (SDL_GetKeyboardState(NULL)[SDL_SCANCODE_ESCAPE]) {
+                    /* a button pressed while Menu is held: a combo, so
+                       releasing Menu will not quit */
+                    menuCombo = 1;
+                    if (!hsOpen) {
+                        if (event.key.keysym.sym == SDLK_RETURN) {
+                            setSmooth60(!smooth60, 1); /* Menu+Start */
+                        } else if (event.key.keysym.sym == SDLK_RCTRL) {
+                            hsOpenViewer();            /* Menu+Select */
+                        }
+                    }
+                    break;
+                }
+                if (hsOpen) {
+                    /* the High Scores box takes the buttons */
+                    hsKey(event.key.keysym.sym);
+                    if (hsOpen && (event.key.keysym.sym == SDLK_UP || event.key.keysym.sym == SDLK_DOWN)) {
+                        repeatKey = event.key.keysym.sym; /* hold to run through the letters */
+                        repeatAt = SDL_GetTicks() + KEY_REPEAT_DELAY_MS;
+                    }
+                    break;
+                }
+                event.key.keysym.sym = miyooMapKey(event.key.keysym.sym);
+                if (event.key.keysym.sym == KEY_MOUSE_JUMP) {
+                    handleMouseClick(); /* B/R1: jump, as a mouse click */
+                    break;
+                }
                 handleKeydownMessage(&event);
+                if (isRepeatableKey(event.key.keysym.sym)) {
+                    repeatKey = event.key.keysym.sym;
+                    repeatAt = SDL_GetTicks() + KEY_REPEAT_DELAY_MS;
+                }
                 if (event.key.keysym.sym == SDLK_F10) {
                     is_running = 0;
                 }
                 break;
-            case SDL_MOUSEBUTTONDOWN:
-                if (inputEnabled != 0) {
-                    handleMouseClick();
+            case SDL_KEYUP:
+                if (event.key.keysym.sym == SDLK_ESCAPE) {
+                    /* Menu released: quit, unless it was a combo (Menu+Select,
+                       Menu+Power screenshot...) or the High Scores box is open */
+                    if (menuOtherKeyPressed()) {
+                        menuCombo = 1;
+                    }
+                    if (!menuCombo && !hsOpen) {
+                        is_running = 0;
+                    }
+                    break;
+                }
+                if (miyooMapKey(event.key.keysym.sym) == repeatKey) {
+                    repeatKey = 0;
                 }
                 break;
             }
         }
 
-        if (isGameTimerRunning && last_timer + 40 < SDL_GetTicks()) {
-            timerUpdateFunc();
-            last_timer = SDL_GetTicks();
+        now = SDL_GetTicks();
+        if (is_running && repeatKey != 0 && (Sint32)(now - repeatAt) >= 0) {
+            SDL_Event repeatEvent;
+            memset(&repeatEvent, 0, sizeof(repeatEvent));
+            repeatEvent.type = SDL_KEYDOWN;
+            repeatEvent.key.keysym.sym = repeatKey;
+            if (hsOpen) {
+                hsKey(repeatKey);
+            } else {
+                handleKeydownMessage(&repeatEvent);
+            }
+            repeatAt = now + KEY_REPEAT_RATE_MS;
         }
 
-        mainWindowPaint(hSkiMainWnd);
+        if (isGameTimerRunning) {
+            if ((Sint32)(now - nextTick) >= 0) {
+                needPresent = 0;
+                timerUpdateFunc(); /* updates the game and draws the frame */
+                nextTick += GAME_TICK_MS;
+                if ((Sint32)(now - nextTick) >= 0) {
+                    nextTick = now + GAME_TICK_MS;
+                }
+            }
+        } else {
+            nextTick = now + GAME_TICK_MS;
+        }
+        if (noticeSurface != NULL && (Sint32)(now - noticeUntil) >= 0) {
+            SDL_FreeSurface(noticeSurface);
+            noticeSurface = NULL;
+            needPresent = 1;
+        }
+        if (hsOpen) {
+            /* blinking cursor of the name being typed */
+            static int blink = -1;
+            int phase = (int)((SDL_GetTicks() / 500) & 1);
+            if (phase != blink) {
+                blink = phase;
+                needPresent = 1;
+            }
+        }
+        if (smooth60 && isGameTimerRunning && is_running) {
+            Uint32 now3 = SDL_GetTicks() * 3;
+            if ((Sint32)(now3 - nextFrame3) >= 0) {
+                paintSmoothFrame(now3 / 3);
+                needPresent = 0;
+                nextFrame3 += FRAME_60_MS3;
+                if ((Sint32)(now3 - nextFrame3) >= 0) {
+                    nextFrame3 = now3 + FRAME_60_MS3;
+                }
+            }
+        }
+        if (needPresent && is_running) {
+            mainWindowPaint(hSkiMainWnd);
+            needPresent = 0;
+        }
     }
     cleanupSound();
     return 0;
@@ -145,11 +404,16 @@ void timerUpdateFunc(void) {
     timerFrameDurationInMillis = ticks - currentTickCount;
     prevTickCount = currentTickCount;
     currentTickCount = ticks;
+    interpSnapshot(); /* Miyoo Mini port (60 fps) */
     updateGameState();
-    drawWindow(mainWindowDC, &windowClientRect);
     redrawRequired = TRUE;
     if (currentTickCount - statusWindowLastUpdateTime > 327) {
         formatAndPrintStatusStrings(statusWindowDC);
+    }
+    /* draw the frame once per tick, as the original did here with
+       drawWindow; at 60 fps the main loop draws instead */
+    if (!smooth60) {
+        mainWindowPaint(hSkiMainWnd);
     }
 }
 
@@ -160,8 +424,10 @@ void assertFailedDialog(LPCSTR lpCaption, LPCSTR lpText) {
     // {
     //     DestroyWindow(hSkiMainWnd);
     // }
-    printf("Assert failed: %s\n", lpText);
-    abort();
+    /* Miyoo Mini port: no dialog box here. Log it and carry on, as pressing
+       OK did in the original (assertFailed then pauses the game). */
+    fprintf(stderr, "%s: %s\n", lpCaption, lpText);
+    fflush(stderr);
 }
 
 void assertFailed(const char* srcFilename, int lineNumber) {
@@ -226,20 +492,510 @@ int formatElapsedTime(int totalMillis, char* outputString) {
     return strlen(outputString);
 }
 
+/* Miyoo Mini port: text in black with the Windows OEM font (oemfont.h), as
+   TextOutA drew it with OEM_FIXED_FONT. dst must be a 32-bit surface. */
+static void drawOemTextColor(SDL_Surface* dst, const char* text, int x, int y, int white) {
+    Uint32 black;
+    int row, col;
+
+    if (dst == NULL) {
+        return;
+    }
+    black = white ? SDL_MapRGB(dst->format, 255, 255, 255) : SDL_MapRGB(dst->format, 0, 0, 0);
+
+    for (; *text != '\0'; text++, x += OEMFONT_W) {
+        const unsigned char* glyph = oemFont[(unsigned char)*text];
+        for (row = 0; row < OEMFONT_H; row++) {
+            Uint32* line;
+            if (y + row < 0 || y + row >= dst->h) {
+                continue;
+            }
+            line = (Uint32*)((Uint8*)dst->pixels + (y + row) * dst->pitch);
+            for (col = 0; col < OEMFONT_W; col++) {
+                if ((glyph[row] & (0x80 >> col)) && x + col >= 0 && x + col < dst->w) {
+                    line[x + col] = black;
+                }
+            }
+        }
+    }
+}
+
+static void drawOemText(SDL_Surface* dst, const char* text, int x, int y) {
+    drawOemTextColor(dst, text, x, y, 0);
+}
+
+/* Miyoo Mini port: "Ski Paused" box. The original shows this text in the
+   title bar, which this screen does not have. */
+static void createPausedTexture(void) {
+    const char* text = "Ski Paused ... Press Start to continue";
+    int w = (int)strlen(text) * OEMFONT_W + 6;
+    int h = OEMFONT_H + 6;
+    SDL_Surface* s = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ARGB8888);
+    SDL_Rect inside = { 1, 1, w - 2, h - 2 };
+
+    if (s == NULL) {
+        return;
+    }
+    SDL_FillRect(s, NULL, SDL_MapRGB(s->format, 0, 0, 0));
+    SDL_FillRect(s, &inside, SDL_MapRGB(s->format, 255, 255, 255));
+    drawOemText(s, text, 3, 3);
+    SDL_SetSurfaceBlendMode(s, SDL_BLENDMODE_NONE);
+    pausedSurface = s;
+}
+
+/* ---- Miyoo Mini port: High Scores -------------------------------------------
+   The original keeps the 10 best results of each course in ENTPACK.INI
+   (times for the two slaloms, style points for freestyle) and, when a run
+   ends, shows them in a "High Scores" message box: the new result is marked
+   " <-- that's you", or added below the list with " <-- try again!".
+   This port does the same, adds a name to each result, typed with the D-pad
+   as in the other Miyoo ports (Up/Down: letter, Left: a/A, Right: space,
+   A: keep the letter, B: erase, Start: save), and Menu+Select opens the
+   tables at any time. They are saved in highscores.txt, in the game folder. */
+#define HS_FILE "highscores.txt"
+#define HS_ROWS 10
+#define HS_NAME_LEN 20
+#define HS_COURSES 3
+#define HS_LINE_H 14
+#define HS_COLS 52   /* width of the box, in characters */
+#define HS_VALUE_COL 25
+
+typedef struct {
+    int count;
+    int value[HS_ROWS];
+    char name[HS_ROWS][HS_NAME_LEN + 1];
+} HsTable;
+
+/* same keys as the original's ENTPACK.INI */
+static const char* hsKeys[HS_COURSES] = { "SS", "FS", "GS" };
+static const char* hsTitles[HS_COURSES] = { "Slalom", "Freestyle", "Tree Slalom" };
+static const int hsIsTime[HS_COURSES] = { 1, 0, 1 };
+static const char hsCharset[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ";
+#define HS_CHARSET_LEN ((int)sizeof(hsCharset) - 1)
+
+static HsTable hsTables[HS_COURSES];
+static char hsDefaultName[HS_NAME_LEN + 1] = "Skier";
+static int hsLoaded = 0;
+static int hsCourse = 0;       /* table on the screen */
+static int hsRunCourse = -1;   /* course of the run that just ended */
+static int hsMarkRow = -1;     /* " <-- that's you" */
+static int hsTryAgain = 0;     /* the run did not make the top 10 */
+static int hsEditing = 0;      /* typing the name of a new record */
+static int hsNewRow = 0;
+static int hsNewValue = 0;
+static int hsResume = 0;       /* the game timer was running when the box opened */
+static int hsConfirmClear = 0;
+static int hsPreview = 0;      /* a letter is being chosen (shown inverted) */
+static int hsCycle = 0;
+static int hsLower = 0;
+static char hsName[HS_NAME_LEN + 1];
+
+void startGameTimer();
+
+static void hsLoad(void) {
+    char line[128];
+    FILE* f;
+
+    hsLoaded = 1;
+    memset(hsTables, 0, sizeof(hsTables));
+    f = fopen(HS_FILE, "r");
+    if (f == NULL) {
+        return;
+    }
+    while (fgets(line, sizeof(line), f) != NULL) {
+        char key[8];
+        int value, n = 0, c;
+
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strncmp(line, "NAME ", 5) == 0) {
+            snprintf(hsDefaultName, sizeof(hsDefaultName), "%.20s", line + 5);
+            continue;
+        }
+        if (sscanf(line, "%7s %d %n", key, &value, &n) < 2 || n == 0) {
+            continue;
+        }
+        for (c = 0; c < HS_COURSES; c++) {
+            HsTable* t = &hsTables[c];
+            if (strcmp(key, hsKeys[c]) == 0 && t->count < HS_ROWS) {
+                t->value[t->count] = value;
+                snprintf(t->name[t->count], HS_NAME_LEN + 1, "%s", line + n);
+                t->count++;
+            }
+        }
+    }
+    fclose(f);
+}
+
+static void hsSave(void) {
+    FILE* f = fopen(HS_FILE ".tmp", "w");
+    int c, i;
+
+    if (f == NULL) {
+        fprintf(stderr, "cannot write " HS_FILE "\n");
+        return;
+    }
+    fprintf(f, "NAME %s\n", hsDefaultName);
+    for (c = 0; c < HS_COURSES; c++) {
+        for (i = 0; i < hsTables[c].count; i++) {
+            fprintf(f, "%s %d %s\n", hsKeys[c], hsTables[c].value[i], hsTables[c].name[i]);
+        }
+    }
+    if (fclose(f) == 0) {
+        rename(HS_FILE ".tmp", HS_FILE);
+        sync(); /* keep it even if the device is switched off right after */
+    }
+}
+
+static void hsFormatValue(int course, int value, char* out) {
+    if (hsIsTime[course]) {
+        formatElapsedTime(value, out);
+    } else {
+        sprintf(out, stylePointsFormatString, (long)value);
+    }
+}
+
+/* where a result goes: as in the original, before the first one it beats
+   (a tie goes below); HS_ROWS = not in the top 10 */
+static int hsPlace(int course, int value) {
+    HsTable* t = &hsTables[course];
+    int i;
+    for (i = 0; i < t->count; i++) {
+        if (hsIsTime[course] ? value < t->value[i] : value > t->value[i]) {
+            break;
+        }
+    }
+    return i;
+}
+
+static void hsInsert(int course, int row, int value, const char* name) {
+    HsTable* t = &hsTables[course];
+    int i = t->count < HS_ROWS ? t->count : HS_ROWS - 1;
+    for (; i > row; i--) {
+        t->value[i] = t->value[i - 1];
+        memcpy(t->name[i], t->name[i - 1], HS_NAME_LEN + 1);
+    }
+    t->value[row] = value;
+    snprintf(t->name[row], HS_NAME_LEN + 1, "%s", name);
+    if (t->count < HS_ROWS) {
+        t->count++;
+    }
+}
+
+static void hsShow(int course) {
+    if (!hsLoaded) {
+        hsLoad();
+    }
+    hsCourse = course;
+    hsConfirmClear = 0;
+    hsEditing = 0;
+    hsResume = isGameTimerRunning;
+    pauseGame(); /* as the original: the game stops while the box is up */
+    hsOpen = 1;
+    repeatKey = 0;
+    needPresent = 1;
+}
+
+static void hsClose(void) {
+    hsOpen = 0;
+    hsConfirmClear = 0;
+    if (hsResume) {
+        startGameTimer();
+    }
+    needPresent = 1;
+}
+
+/* Menu+Select */
+static void hsOpenViewer(void) {
+    hsRunCourse = -1;
+    hsTryAgain = 0;
+    hsShow(hsCourse);
+}
+
+/* end of a run (called where the original updates ENTPACK.INI) */
+static void hsRunFinished(const char* configKey, int value) {
+    int c;
+    for (c = 0; c < HS_COURSES; c++) {
+        if (strcmp(configKey, hsKeys[c]) == 0) {
+            break;
+        }
+    }
+    if (c == HS_COURSES) {
+        return;
+    }
+    hsShow(c);
+    hsRunCourse = c;
+    hsMarkRow = -1;
+    hsTryAgain = 0;
+    hsNewValue = value;
+    hsNewRow = hsPlace(c, value);
+    if (hsNewRow >= HS_ROWS) {
+        hsTryAgain = 1;
+        return;
+    }
+    hsEditing = 1;
+    hsName[0] = '\0';
+    hsPreview = 0;
+    hsCycle = 0;
+    hsLower = 0;
+}
+
+static char hsCurrentChar(void) {
+    char c = hsCharset[hsCycle];
+    if (hsLower && c >= 'A' && c <= 'Z') {
+        c = (char)(c - 'A' + 'a');
+    }
+    return c;
+}
+
+static void hsSaveName(void) {
+    int len = (int)strlen(hsName);
+    while (len > 0 && hsName[len - 1] == ' ') {
+        hsName[--len] = '\0';
+    }
+    if (len == 0) {
+        snprintf(hsName, sizeof(hsName), "%s", hsDefaultName);
+    } else {
+        snprintf(hsDefaultName, sizeof(hsDefaultName), "%s", hsName);
+    }
+    hsInsert(hsRunCourse, hsNewRow, hsNewValue, hsName);
+    hsMarkRow = hsNewRow;
+    hsEditing = 0;
+    hsSave();
+}
+
+static void hsKey(SDL_Keycode sym) {
+    needPresent = 1;
+    if (hsEditing) {
+        int len = (int)strlen(hsName);
+        switch (sym) {
+        case SDLK_UP:
+        case SDLK_DOWN:
+            if (hsPreview) {
+                hsCycle = (hsCycle + (sym == SDLK_UP ? 1 : HS_CHARSET_LEN - 1)) % HS_CHARSET_LEN;
+            } else if (len < HS_NAME_LEN) {
+                hsPreview = 1;
+            }
+            break;
+        case SDLK_LEFT: /* upper/lower case */
+            hsLower = !hsLower;
+            break;
+        case SDLK_RIGHT: /* space */
+            if (len < HS_NAME_LEN) {
+                hsName[len] = ' ';
+                hsName[len + 1] = '\0';
+            }
+            hsPreview = 0;
+            hsCycle = 0;
+            break;
+        case SDLK_SPACE: /* A: keep the letter */
+            if (hsPreview && len < HS_NAME_LEN) {
+                hsName[len] = hsCurrentChar();
+                hsName[len + 1] = '\0';
+            }
+            hsPreview = 0;
+            hsCycle = 0;
+            break;
+        case SDLK_LCTRL: /* B: erase */
+            if (hsPreview) {
+                hsPreview = 0;
+            } else if (len > 0) {
+                hsName[len - 1] = '\0';
+            }
+            hsCycle = 0;
+            break;
+        case SDLK_RETURN: /* Start: save */
+            hsSaveName();
+            break;
+        default:
+            break;
+        }
+        return;
+    }
+    if (hsConfirmClear) {
+        if (sym == SDLK_SPACE) { /* A: yes */
+            hsTables[hsCourse].count = 0;
+            if (hsRunCourse == hsCourse) {
+                hsMarkRow = -1;
+            }
+            hsSave();
+            hsConfirmClear = 0;
+        } else if (sym == SDLK_LCTRL) { /* B: no */
+            hsConfirmClear = 0;
+        }
+        return;
+    }
+    switch (sym) {
+    case SDLK_LEFT:
+        hsCourse = (hsCourse + HS_COURSES - 1) % HS_COURSES;
+        break;
+    case SDLK_RIGHT:
+        hsCourse = (hsCourse + 1) % HS_COURSES;
+        break;
+    case SDLK_RCTRL: /* Select: clear this table (asks first) */
+        if (hsTables[hsCourse].count > 0) {
+            hsConfirmClear = 1;
+        }
+        break;
+    case SDLK_SPACE:  /* A */
+    case SDLK_LCTRL:  /* B */
+    case SDLK_RETURN: /* Start */
+    case SDLK_LALT:   /* Y */
+        hsClose();
+        break;
+    default:
+        break;
+    }
+}
+
+static void hsFill(SDL_Surface* s, int x, int y, int w, int h, int white) {
+    SDL_Rect r = { x, y, w, h };
+    SDL_FillRect(s, &r, white ? SDL_MapRGB(s->format, 255, 255, 255) : SDL_MapRGB(s->format, 0, 0, 0));
+}
+
+/* the box, black on white with the game's OEM font, like the original's
+   message box */
+static void hsDraw(SDL_Surface* dst) {
+    char lines[24][HS_COLS + 16];
+    int editLine = -1, nLines = 0, i, w, h, x0, y0;
+    HsTable* t = &hsTables[hsCourse];
+    int editingHere = hsEditing && hsCourse == hsRunCourse;
+    char value[32];
+
+    snprintf(lines[nLines++], sizeof(lines[0]), "%s", getCachedString(IDS_HIGH_SCORES));
+    if (hsEditing) {
+        snprintf(lines[nLines++], sizeof(lines[0]), "%s", hsTitles[hsCourse]);
+    } else {
+        snprintf(lines[nLines++], sizeof(lines[0]), "<  %s  >", hsTitles[hsCourse]);
+    }
+    lines[nLines++][0] = '\0';
+
+    for (i = 0; i < HS_ROWS; i++) {
+        int src = i;
+        if (editingHere && i == hsNewRow) {
+            hsFormatValue(hsCourse, hsNewValue, value);
+            snprintf(lines[nLines], sizeof(lines[0]), "%2d.%*s%s", i + 1, HS_VALUE_COL - 3, "", value);
+            editLine = nLines++;
+            continue;
+        }
+        if (editingHere && i > hsNewRow) {
+            src = i - 1;
+        }
+        if (src < t->count) {
+            hsFormatValue(hsCourse, t->value[src], value);
+            snprintf(lines[nLines], sizeof(lines[0]), "%2d. %-*s %s%s", i + 1, HS_NAME_LEN, t->name[src], value,
+                     (!hsEditing && hsCourse == hsRunCourse && src == hsMarkRow) ? getCachedString(IDS_THATS_YOU) : "");
+        } else {
+            snprintf(lines[nLines], sizeof(lines[0]), "%2d.", i + 1);
+        }
+        nLines++;
+    }
+
+    if (hsTryAgain && hsCourse == hsRunCourse) {
+        lines[nLines++][0] = '\0';
+        hsFormatValue(hsCourse, hsNewValue, value);
+        snprintf(lines[nLines++], sizeof(lines[0]), "%*s%s%s", HS_VALUE_COL, "", value, getCachedString(IDS_TRY_AGAIN));
+    }
+
+    lines[nLines++][0] = '\0';
+    if (hsEditing) {
+        snprintf(lines[nLines++], sizeof(lines[0]), "Up/Down: letter   Left: a/A   Right: space");
+        snprintf(lines[nLines++], sizeof(lines[0]), "A: next letter   B: erase   Start: save");
+        snprintf(lines[nLines++], sizeof(lines[0]), "Empty name: saved as %s", hsDefaultName);
+    } else if (hsConfirmClear) {
+        snprintf(lines[nLines++], sizeof(lines[0]), "Clear the %s table?", hsTitles[hsCourse]);
+        snprintf(lines[nLines++], sizeof(lines[0]), "A: yes   B: no");
+    } else {
+        snprintf(lines[nLines++], sizeof(lines[0]), "Left/Right: course   Select: clear");
+        snprintf(lines[nLines++], sizeof(lines[0]), "A, B, Start or Y: close");
+    }
+
+    w = HS_COLS * OEMFONT_W + 2 * 10;
+    h = nLines * HS_LINE_H + 2 * 8;
+    x0 = (dst->w - w) / 2;
+    y0 = (dst->h - h) / 2;
+    hsFill(dst, x0, y0, w, h, 0);
+    hsFill(dst, x0 + 2, y0 + 2, w - 4, h - 4, 1);
+
+    for (i = 0; i < nLines; i++) {
+        int x = x0 + 10;
+        int y = y0 + 8 + i * HS_LINE_H;
+        if (i < 2) {
+            x = x0 + (w - (int)strlen(lines[i]) * OEMFONT_W) / 2; /* title, centred */
+        }
+        drawOemText(dst, lines[i], x, y);
+        if (i == editLine) {
+            /* the name being typed, the letter being chosen (inverted) or a
+               blinking cursor */
+            int nx = x + 4 * OEMFONT_W;
+            drawOemText(dst, hsName, nx, y);
+            nx += (int)strlen(hsName) * OEMFONT_W;
+            if (hsPreview) {
+                char ch[2] = { hsCurrentChar(), '\0' };
+                hsFill(dst, nx, y - 1, OEMFONT_W, OEMFONT_H + 2, 0);
+                drawOemTextColor(dst, ch, nx, y, 1);
+            } else if ((int)strlen(hsName) < HS_NAME_LEN && ((SDL_GetTicks() / 500) & 1) == 0) {
+                drawOemText(dst, "_", nx, y);
+            }
+        }
+    }
+    (void)h;
+}
+
+/* Miyoo Mini port: Menu+Start switches between 60 fps and the original 25,
+   with a message for a moment; the choice is saved in framerate.cfg */
+static void setSmooth60(int on, int showNotice) {
+    const char* text;
+    int w, h;
+    SDL_Rect inside;
+
+    smooth60 = on;
+    nextFrame3 = SDL_GetTicks() * 3;
+    needPresent = 1;
+    if (!showNotice) {
+        return;
+    }
+    {
+        FILE* f = fopen(FRAMERATE_FILE, "w");
+        if (f != NULL) {
+            fprintf(f, "%d\n", smooth60 ? 60 : 25);
+            fclose(f);
+        }
+    }
+    text = smooth60 ? "Frame rate: 60 fps" : "Frame rate: original (25 fps)";
+    w = (int)strlen(text) * OEMFONT_W + 6;
+    h = OEMFONT_H + 6;
+    inside.x = 1;
+    inside.y = 1;
+    inside.w = w - 2;
+    inside.h = h - 2;
+    if (noticeSurface != NULL) {
+        SDL_FreeSurface(noticeSurface);
+    }
+    noticeSurface = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ARGB8888);
+    if (noticeSurface != NULL) {
+        SDL_SetSurfaceBlendMode(noticeSurface, SDL_BLENDMODE_NONE);
+        SDL_FillRect(noticeSurface, NULL, SDL_MapRGB(noticeSurface->format, 0, 0, 0));
+        SDL_FillRect(noticeSurface, &inside, SDL_MapRGB(noticeSurface->format, 255, 255, 255));
+        drawOemText(noticeSurface, text, 3, 3);
+        noticeUntil = SDL_GetTicks() + 1500;
+    }
+}
+
+static void loadSmooth60(void) {
+    FILE* f = fopen(FRAMERATE_FILE, "r");
+    int v = 60;
+    if (f != NULL) {
+        if (fscanf(f, "%d", &v) != 1) {
+            v = 60;
+        }
+        fclose(f);
+    }
+    setSmooth60(v != 25, 0);
+}
+
 void drawText(HDC hdc, LPCSTR textStr, short x, short* y, int textLen) {
     // TextOutA(hdc, (int)x, (int)*y, textStr, textLen);
-
-    SDL_Surface* surface;
-    SDL_Color textColor = { 0, 0, 0, 0 };
-
-    surface = TTF_RenderUTF8_Blended_Wrapped(statusWindowFont, textStr, textColor, 255);
-    SDL_Rect rect;
-    rect.x = x;
-    rect.y = *y;
-    rect.w = surface->w;
-    rect.h = surface->h;
-    SDL_BlitSurface(surface, NULL, statusWindowSurface, &rect);
-    SDL_FreeSurface(surface);
+    drawOemText(statusWindowSurface, textStr, x, *y);
     *y = *y + textLineHeight;
 }
 
@@ -363,7 +1119,6 @@ Actor* updateActorType2_dog(Actor* actor) {
         updateActorPositionMaybe(new_actor, (short)(sVar1 - 4), newY, inAir);
         actorFrameNo = 0x1b;
 //        playSound(&sound_8);
-        Mix_PlayChannel(-1, piddle, 0);
     }
     new_actor = updateActorPositionWithVelocityMaybe(actor);
     return setActorFrameNo(new_actor, actorFrameNo);
@@ -392,6 +1147,8 @@ Actor* getLinkedActorIfExists(Actor* actor) {
 
 int showErrorMessage(LPCSTR text) {
     // return MessageBoxA(NULL, text, getCachedString(IDS_TITLE), 0x30);
+    fprintf(stderr, "%s\n", text);
+    fflush(stderr);
     return SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, getCachedString(IDS_TITLE), text, hSkiMainWnd);
 }
 
@@ -484,19 +1241,6 @@ int initWindows() {
 //        loadSound(9, &sound_9);
 //        loadSound(7, &sound_7);
 //        loadSound(8, &sound_8);
-          piddle = Mix_LoadWAV("resources/piddle.wav");
-          gobble = Mix_LoadWAV("resources/gobble.wav");
-          jump = Mix_LoadWAV("resources/jump.wav");
-          land = Mix_LoadWAV("resources/land.wav");
-          ooh = Mix_LoadWAV("resources/ooh.wav");
-          ouch = Mix_LoadWAV("resources/ouch.wav");
-          snowboard = Mix_LoadWAV("resources/snowboard.wav");
-          step = Mix_LoadWAV("resources/step.wav");
-          whoosh = Mix_LoadWAV("resources/whoosh.wav");
-          woof = Mix_LoadWAV("resources/woof.wav");
-          ding = Mix_LoadWAV("resources/ding.wav");
-          buzz = Mix_LoadWAV("resources/buzz.wav");
-          grind = Mix_LoadWAV("resources/grind.wav");
     }
 
 
@@ -515,6 +1259,10 @@ int initWindows() {
     nWidth = 1008;
     nHeight = nWidth * 0.97718253968254f;
 
+    /* Miyoo Mini port: the whole 640x480 screen, one game pixel per screen pixel */
+    nWidth = 640;
+    nHeight = 480;
+
     if (fullscreen)
         flags = SDL_WINDOW_SHOWN | SDL_WINDOW_FULLSCREEN_DESKTOP;
     else
@@ -526,7 +1274,20 @@ int initWindows() {
         nWidth, nHeight,
         flags);
 
-    renderer = SDL_CreateRenderer(hSkiMainWnd, -1, SDL_RENDERER_SOFTWARE);
+    if (hSkiMainWnd == NULL) {
+        fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
+        return 0;
+    }
+
+    /* as in the Pinball port: the device's own renderer, else SDL's software one */
+    renderer = SDL_CreateRenderer(hSkiMainWnd, -1, SDL_RENDERER_ACCELERATED);
+    if (renderer == NULL) {
+        renderer = SDL_CreateRenderer(hSkiMainWnd, -1, SDL_RENDERER_SOFTWARE);
+    }
+    if (renderer == NULL) {
+        fprintf(stderr, "SDL_CreateRenderer: %s\n", SDL_GetError());
+        return 0;
+    }
 
     SDL_RendererInfo info;
     SDL_GetRendererInfo(renderer, &info);
@@ -538,15 +1299,22 @@ int initWindows() {
 
     SDL_SetRenderDrawColor(renderer, 0xff, 0xff, 0xff, 0xFF);
 
-    calculateStatusWindowDimensions(hSkiStatusWnd);
-    statusWindowTexture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_STREAMING, statusWindowTotalTextWidth, statusWindowHeight);
+    screenSurface = SDL_CreateRGBSurfaceWithFormat(0, nWidth, nHeight, 32, SDL_PIXELFORMAT_ARGB8888);
+    screenTexture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, nWidth, nHeight);
+    if (screenSurface == NULL || screenTexture == NULL) {
+        fprintf(stderr, "screen: %s\n", SDL_GetError());
+        return 0;
+    }
+    SDL_SetSurfaceBlendMode(screenSurface, SDL_BLENDMODE_NONE);
+    SDL_SetTextureBlendMode(screenTexture, SDL_BLENDMODE_NONE);
 
-    embedded_resource_t* res = get_embedded_resource_by_name("resources/cursor.png");
-    SDL_RWops* src = SDL_RWFromConstMem(res->content, res->len);
-    //SDL_Surface *cursorSurface = IMG_Load("resources/cursor.png");
-    SDL_Surface *cursorSurface = IMG_Load_RW(src, 1);
-    CursorTexture = SDL_CreateTextureFromSurface(renderer, cursorSurface);
-    SDL_FreeSurface(cursorSurface);
+    calculateStatusWindowDimensions(hSkiStatusWnd);
+    statusWindowSurface = SDL_CreateRGBSurfaceWithFormat(0, statusWindowTotalTextWidth, statusWindowHeight, 32, SDL_PIXELFORMAT_ARGB8888);
+    if (statusWindowSurface != NULL) {
+        SDL_SetSurfaceBlendMode(statusWindowSurface, SDL_BLENDMODE_NONE);
+    }
+
+    createPausedTexture();
 
     SDL_ShowCursor(SDL_DISABLE);
 
@@ -685,19 +1453,6 @@ void cleanupSound() {
         //freeSoundResource(&sound_9);
         //freeSoundResource(&sound_7);
         //freeSoundResource(&sound_8);
-        Mix_FreeChunk(piddle);
-        Mix_FreeChunk(gobble);
-        Mix_FreeChunk(jump);
-        Mix_FreeChunk(land);
-        Mix_FreeChunk(ooh);
-        Mix_FreeChunk(ouch);
-        Mix_FreeChunk(snowboard);
-        Mix_FreeChunk(step);
-        Mix_FreeChunk(whoosh);
-        Mix_FreeChunk(woof);
-        Mix_FreeChunk(ding);
-        Mix_FreeChunk(buzz);
-        Mix_FreeChunk(grind);
     }
 }
 
@@ -714,6 +1469,7 @@ void cleanupSound() {
 void togglePausedState() {
     char* str;
 
+    needPresent = 1; /* show or hide the "Ski Paused" box */
     isPaused = isGameTimerRunning;
     if (isGameTimerRunning != 0) {
         pauseGame();
@@ -765,6 +1521,7 @@ Actor* addActor(Actor* actor, BOOL insertBack) {
         currentFreeActor = targetActor->next;
 
         memcpy(targetActor, actor, sizeof(Actor));
+        interpValid[targetActor - actors] = 0; /* Miyoo Mini port (60 fps): new object */
 
         targetActor->permObject = NULL;
         if (insertBack) {
@@ -888,7 +1645,10 @@ void mainWindowPaint(HWND param_1) {
     r.top = 0;
     r.bottom = windowClientRect.bottom;
 
-    SDL_RenderClear(renderer);
+    if (screenSurface == NULL) {
+        return;
+    }
+    SDL_FillRect(screenSurface, NULL, SDL_MapRGB(screenSurface->format, 255, 255, 255));
 
     paintActors(NULL, &r);
 
@@ -898,12 +1658,27 @@ void mainWindowPaint(HWND param_1) {
     dstrect.y = 0;
     dstrect.w = statusWindowTotalTextWidth;
     dstrect.h = statusWindowHeight;
-    SDL_RenderCopy(renderer, statusWindowTexture, NULL, &dstrect);
+    if (statusWindowSurface != NULL) {
+        SDL_BlitSurface(statusWindowSurface, NULL, screenSurface, &dstrect);
+    }
 
-    SDL_Rect cursorRect = {mouseX, mouseY, 20, 22};
+    if (isPaused && pausedSurface != NULL) {
+        SDL_Rect pausedRect = { 0, 0, pausedSurface->w, pausedSurface->h };
+        SDL_BlitSurface(pausedSurface, NULL, screenSurface, &pausedRect);
+    }
 
-    SDL_RenderCopy(renderer, CursorTexture, NULL, &cursorRect);
+    if (noticeSurface != NULL) {
+        SDL_Rect noticeRect = { 0, (isPaused && pausedSurface != NULL) ? pausedSurface->h + 2 : 0, noticeSurface->w, noticeSurface->h };
+        SDL_BlitSurface(noticeSurface, NULL, screenSurface, &noticeRect);
+    }
 
+    if (hsOpen) {
+        hsDraw(screenSurface);
+    }
+
+    /* the whole screen to the display in one piece */
+    SDL_UpdateTexture(screenTexture, NULL, screenSurface->pixels, screenSurface->pitch);
+    SDL_RenderCopy(renderer, screenTexture, NULL, NULL);
     SDL_RenderPresent(renderer);
 }
 
@@ -935,9 +1710,8 @@ void statusWindowFindLongestTextString(HDC hdc, short* maxLength, LPCSTR textStr
     //     *maxLength = (short)size.cx;
     // }
 
-    int w, h;
+    int w = (int)strlen(textStr) * OEMFONT_W;
 
-    TTF_SizeUTF8(statusWindowFont, textStr, &w, &h);
     if (*maxLength < w) {
         *maxLength = w;
     }
@@ -954,7 +1728,9 @@ void paintStatusWindow(HWND hWnd) {
     // hbr = (HBRUSH)GetStockObject(4);
     // FrameRect(paint.hdc, &statusBorderRect, hbr);
 
-    SDL_LockTextureToSurface(statusWindowTexture, NULL, &statusWindowSurface);
+    if (statusWindowSurface == NULL) {
+        return;
+    }
 
     SDL_FillRect(statusWindowSurface, NULL, SDL_MapRGB(statusWindowSurface->format, 0, 0, 0));
     SDL_Rect r = { 1, 1, statusWindowSurface->w - 2, statusWindowSurface->h - 2 };
@@ -978,7 +1754,6 @@ void paintStatusWindow(HWND hWnd) {
     formatAndPrintStatusStrings(NULL);
     // EndPaint(hWnd, &paint);
 
-    SDL_UnlockTexture(statusWindowTexture);
 }
 
 BOOL calculateStatusWindowDimensions(HWND hWnd) {
@@ -987,7 +1762,6 @@ BOOL calculateStatusWindowDimensions(HWND hWnd) {
     short maxKeyLength;
     short maxValueLength;
     // TEXTMETRIC textMetric;
-    int w, h;
 
     maxKeyLength = 0;
     maxValueLength = 0;
@@ -1001,16 +1775,8 @@ BOOL calculateStatusWindowDimensions(HWND hWnd) {
     // {
     //     statusWindowFont = SelectObject(statusWindowDC, statusWindowFont);
     // }
-    embedded_resource_t* res = get_embedded_resource_by_name("resources/vgaoem.fon");
-    SDL_RWops* src = SDL_RWFromConstMem(res->content, res->len);
-    statusWindowFont = TTF_OpenFontRW(src, 1, 12);
-    if (statusWindowFont == NULL) {
-        exit(1);
-    }
-
     // GetTextMetricsA(statusWindowDC, &textMetric);
-    TTF_SizeUTF8(statusWindowFont, "Ay", &w, &h);
-    textLineHeight = h;
+    textLineHeight = OEMFONT_H; /* tmHeight of the OEM font */
     str = getCachedString(IDS_TIME);
     len = strlen(str);
     statusWindowFindLongestTextString(statusWindowDC, &maxKeyLength, str, len);
@@ -1278,8 +2044,15 @@ HBITMAP loadBitmapResource(uint32_t resourceId) {
     // SDL_Surface* bitmap = IMG_Load(filename);
 
     embedded_resource_t* res = get_embedded_resource_by_name(filename);
+    if (res == NULL) {
+        fprintf(stderr, "missing %s\n", filename);
+        return NULL;
+    }
     SDL_RWops* src = SDL_RWFromConstMem(res->content, res->len);
-    SDL_Surface* bitmap = IMG_Load_RW(src, 1);
+    SDL_Surface* bitmap = SDL_LoadBMP_RW(src, 1);
+    if (bitmap == NULL) {
+        fprintf(stderr, "%s: %s\n", filename, SDL_GetError());
+    }
     return bitmap;
 }
 
@@ -1757,10 +2530,8 @@ Actor* updatePlayerActor(Actor* actor) {
                 if (ActorframeNo == 0x11) {
                     addStylePoints(-0x40);
                     //sound = &sound_1;
-                    //Mix_PlayChannel(-1, jump, 0);
                 } else {
                     //sound = &sound_4;
-                    Mix_PlayChannel(-1, land, 0);
                 }
                 //playSound(sound);
             }
@@ -1827,10 +2598,8 @@ void updateSsGameMode(Actor* actor, short xPos, short yPos) {
                 iVar1 = FUN_00402e30((int)x, (int)xPos, (int)y, (int)yPos, (int)currentSlalomFlag->maybeY);
                 if (((currentSlalomFlag->spriteIdx == 0x17) && ((short)iVar1 > currentSlalomFlag->maybeX)) || ((currentSlalomFlag->spriteIdx == 0x18 && ((short)iVar1 < currentSlalomFlag->maybeX)))) {
                     spriteIdx = 0x1a;
-                    Mix_PlayChannel(-1, buzz, 0);
                     timedGameRelated = timedGameRelated - 5000;
                 } else {
-                    Mix_PlayChannel(-1, ding, 0);
                 }
                 permObjectSetSpriteIdx(currentSlalomFlag, spriteIdx);
                 currentSlalomFlag = currentSlalomFlag + 1;
@@ -1870,6 +2639,8 @@ void resetPlayerFrameNo() {
 
 // TODO not byte compatible with the original
 void updateEntPackIniKeyValue(LPCSTR configKey, int value, int isTime) {
+    /* Miyoo Mini port: the original's ENTPACK.INI and message box, see hsDraw */
+    hsRunFinished(configKey, value);
     // char cVar1;
     // int *valuePtr;
     // uint32_t uVar2;
@@ -2121,10 +2892,8 @@ void updateGsGameMode(Actor* actor, short xPos, short yPos) {
                 iVar1 = FUN_00402e30((int)x, (int)xPos, (int)y, (int)yPos, (int)currentSlalomFlag->maybeY);
                 if (((currentSlalomFlag->spriteIdx == 0x17) && ((short)iVar1 > currentSlalomFlag->maybeX)) || ((currentSlalomFlag->spriteIdx == 0x18 && ((short)iVar1 < currentSlalomFlag->maybeX)))) {
                     spriteIdx = 0x1a;
-                    Mix_PlayChannel(-1, buzz, 0);
                     timedGameRelated = timedGameRelated - 5000;
                 } else {
-                    Mix_PlayChannel(-1, ding, 0);
                 }
                 permObjectSetSpriteIdx(currentSlalomFlag, spriteIdx);
                 currentSlalomFlag = currentSlalomFlag + 1;
@@ -2343,7 +3112,6 @@ Actor* handleActorCollision(Actor* actor1, Actor* actor2) {
         if (actor2 == playerActor) {
             ski_assert(iVar4 == 0, 2393);
             //playSound(&sound_7);
-            Mix_PlayChannel(-1, gobble, 0);
             if ((actor2->flags & FLAG_1) != 0) {
                 actor2 = duplicateAndLinkActor(actor2);
             }
@@ -2426,7 +3194,6 @@ Actor* handleActorCollision(Actor* actor1, Actor* actor2) {
                 //sound = &sound_2;
                 //                LAB_00403be8:
                 //playSound(sound);
-                Mix_PlayChannel(-1, grind, 0);
                 return setActorFrameNo(actor1, local_c);
             }
         case ACTOR_TYPE_1_BEGINNER:
@@ -2471,7 +3238,6 @@ Actor* handleActorCollision(Actor* actor1, Actor* actor2) {
                 }
                 addStylePoints(-0x20);
                 //playSound(&sound_1);
-                Mix_PlayChannel(-1, ouch, 0);
                 return setActorFrameNo(actor1, local_c);
             }
             break;
@@ -2482,7 +3248,6 @@ Actor* handleActorCollision(Actor* actor1, Actor* actor2) {
                 //                        goto LAB_00403cb4;
                 addStylePoints(1);
                 //playSound(&sound_2);
-                Mix_PlayChannel(-1, jump, 0);
                 return setActorFrameNo(actor1, 0xd);
             }
         }
@@ -2497,7 +3262,6 @@ Actor* handleActorCollision(Actor* actor1, Actor* actor2) {
         local_c = (0 < actor2->isInAir) + 0x19;
         //            goto LAB_00403be8;
         //playSound(sound);
-        Mix_PlayChannel(-1, ooh, 0);
         return setActorFrameNo(actor1, local_c);
     case ACTOR_TYPE_2_DOG:
         if (((int)local_c < 0x1d) && ((actor2->HorizontalVelMaybe != 0 || (actor2->verticalVelocityMaybe != 0)))) {
@@ -2508,7 +3272,6 @@ Actor* handleActorCollision(Actor* actor1, Actor* actor2) {
             //sound = &sound_3;
             //                goto LAB_00403be8;
             //playSound(sound);
-            Mix_PlayChannel(-1, woof, 0);
             return setActorFrameNo(actor1, local_c);
         }
         break;
@@ -2529,7 +3292,6 @@ Actor* handleActorCollision(Actor* actor1, Actor* actor2) {
             if (sVar1 < sVar9) {
                 actor1->inAirCounter = actor1->verticalVelocityMaybe / 2;
                 //playSound(&sound_5);
-                Mix_PlayChannel(-1, snowboard, 0);
                 return setActorFrameNo(actor1, 0x21);
             }
         }
@@ -2537,7 +3299,6 @@ Actor* handleActorCollision(Actor* actor1, Actor* actor2) {
     case ACTOR_TYPE_4_CHAIRLIFT:
         break;
     case ACTOR_TYPE_9_TREE_ON_FIRE:
-        Mix_PlayChannel(-1, whoosh, 0);
         break;
     default:
         assertFailed(sourceFilename, 2376);
@@ -2783,7 +3544,6 @@ void updateYeti(PermObject* permObject) {
                     }
                     sVar9 = (short)dY;
                     //playSound(&sound_9);
-                    Mix_PlayChannel(-1, step, 0);
                 }
             }
         }
@@ -2864,7 +3624,9 @@ BOOL resetGame(void) {
     currentTickCount = SDL_GetTicks();
     // todo
     //  srand(currentTickCount);
-    srand(1);
+    /* Miyoo Mini port: the original seeds with GetTickCount(), so every game
+       is different; srand(1) made every game the same. */
+    srand((unsigned int)time(NULL) ^ currentTickCount);
     setupActorList();
     playerActorPtrMaybe_1 = NULL;
     playerActor = NULL;
@@ -3041,7 +3803,13 @@ void updateWindowSize(HWND hWnd) {
     DAT_0040c760 = 0;
     int w, h;
 
-    SDL_GetRendererOutputSize(renderer, &w, &h);
+    if (screenSurface != NULL) {
+        /* Miyoo Mini port: the game area is screenSurface */
+        w = screenSurface->w;
+        h = screenSurface->h;
+    } else {
+        SDL_GetRendererOutputSize(renderer, &w, &h);
+    }
     windowClientRect.right = w;
     windowClientRect.bottom = h;
 
@@ -3121,7 +3889,9 @@ void formatAndPrintStatusStrings(HDC windowDC) {
         }
     }
 
-    SDL_LockTextureToSurface(statusWindowTexture, NULL, &statusWindowSurface);
+    if (statusWindowSurface == NULL) {
+        return;
+    }
     SDL_Rect rect;
     rect.x = x;
     rect.y = 1;
@@ -3143,7 +3913,6 @@ void formatAndPrintStatusStrings(HDC windowDC) {
     drawText(windowDC, strBuf, x, &y, len);
     statusWindowLastUpdateTime = currentTickCount;
 
-    SDL_UnlockTexture(statusWindowTexture);
 }
 
 PermObject* addPermObject(PermObjectList* objList, PermObject* permObject) {
@@ -3504,8 +4273,6 @@ void handleKeydownMessage(SDL_Event* e) {
             }
             break;
 
-        case 0x21:
-        case 0x69:
         case SDLK_PAGEUP:
         case SDLK_KP_9:
             /* numpad 9
@@ -3515,8 +4282,6 @@ void handleKeydownMessage(SDL_Event* e) {
             }
             break;
 
-        case 0x23:
-        case 0x61:
         case SDLK_END:
         case SDLK_KP_1:
             /* numpad 1
@@ -3526,8 +4291,6 @@ void handleKeydownMessage(SDL_Event* e) {
             }
             break;
 
-        case 0x22:
-        case 99:
         case SDLK_PAGEDOWN:
         case SDLK_KP_3:
             /* numpad 3
@@ -3537,8 +4300,6 @@ void handleKeydownMessage(SDL_Event* e) {
             }
             break;
 
-        case 0x2d:
-        case 0x60:
         case SDLK_INSERT:
         case SDLK_KP_0:
             /* numpad 0, Insert
@@ -3814,19 +4575,31 @@ BOOL createBitmapSheets(HDC param_1) {
         //  DeleteObject(pvVar2);
     }
 
+    /* Miyoo Mini port: the sheets stay as surfaces in the screen's pixel
+       format, and sprites are copied into screenSurface (white = transparent) */
+    currentSurface = SDL_ConvertSurfaceFormat(largeBitmapDC, SDL_PIXELFORMAT_ARGB8888, 0);
+    if (currentSurface == NULL) {
+        return FALSE;
+    }
+    SDL_FreeSurface(largeBitmapDC);
+    largeBitmapDC = currentSurface;
+    currentSurface = SDL_ConvertSurfaceFormat(smallBitmapDC, SDL_PIXELFORMAT_ARGB8888, 0);
+    if (currentSurface == NULL) {
+        return FALSE;
+    }
+    SDL_FreeSurface(smallBitmapDC);
+    smallBitmapDC = currentSurface;
+
+    SDL_SetSurfaceBlendMode(largeBitmapDC, SDL_BLENDMODE_NONE);
+    SDL_SetSurfaceBlendMode(smallBitmapDC, SDL_BLENDMODE_NONE);
     SDL_SetColorKey(largeBitmapDC, SDL_TRUE, SDL_MapRGB(largeBitmapDC->format, 0xFF, 0xFF, 0xFF));
     SDL_SetColorKey(smallBitmapDC, SDL_TRUE, SDL_MapRGB(smallBitmapDC->format, 0xFF, 0xFF, 0xFF));
-
-    largeTextureAtlas = SDL_CreateTextureFromSurface(renderer, largeBitmapDC);
-    smallTextureAtlas = SDL_CreateTextureFromSurface(renderer, smallBitmapDC);
+    SDL_SetSurfaceRLE(largeBitmapDC, 1); /* faster copies with a transparent colour */
+    SDL_SetSurfaceRLE(smallBitmapDC, 1);
 
     for (resourceId = 1; (uint16_t)resourceId < 90; resourceId++) {
         sprite = &sprites[resourceId & 0xffff];
-        if (sprite->width > 32) {
-            sprite->sheet = largeTextureAtlas;
-        } else {
-            sprite->sheet = smallTextureAtlas;
-        }
+        sprite->sheetDC = sprite->width > SMALL_TEXTURE_ATLAS_MAX_SIZE ? largeBitmapDC : smallBitmapDC;
     }
 
     // scratchBitmapWidth = ((uint16_t)maxWidth & 0xffc0) + 0x40;
@@ -4095,11 +4868,13 @@ void drawActor(HDC hdc, Actor* actor) {
             srcrect.h = spriteHeight;
 
             SDL_Rect dstrect;
-            dstrect.x = rect->left;
-            dstrect.y = rect->top;
+            int interpX, interpY;
+            interpOffset(actor_00, &interpX, &interpY); /* Miyoo Mini port (60 fps) */
+            dstrect.x = rect->left + interpX;
+            dstrect.y = rect->top + interpY;
             dstrect.w = spriteWidth;
             dstrect.h = spriteHeight;
-            SDL_RenderCopy(renderer, sprite->sheet, &srcrect, &dstrect);
+            SDL_BlitSurface((SDL_Surface*)sprite->sheetDC, &srcrect, screenSurface, &dstrect);
 
             local_24->flags |= FLAG_1;
             *local_4 = local_24->actorPtr;

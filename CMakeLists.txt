@@ -4,9 +4,6 @@ project(skifree_sdl)
 set(CMAKE_MODULE_PATH ${_MODULE_PATH} "${skifree_sdl_SOURCE_DIR}/cmake/")
 
 find_package(SDL2 REQUIRED)
-find_package(SDL2_image REQUIRED)
-find_package(SDL2_mixer REQUIRED)
-find_package(SDL2_ttf REQUIRED)
 
 # Add all c source files under the src directory
 
@@ -61,7 +58,7 @@ endif()
 
 add_custom_command(
     OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/embedded_resources.h"
-    COMMAND "${CMAKE_COMMAND}" "-DSOURCE_DIR=${CMAKE_SOURCE_DIR}" "-DRESOURCES_GLOB=resources/*" -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedResources.cmake"
+    COMMAND "${CMAKE_COMMAND}" "-DSOURCE_DIR=${CMAKE_SOURCE_DIR}" "-DRESOURCES_GLOB=resources/ski32_*.bmp" -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedResources.cmake"
     DEPENDS ${resource_files}
 )
 
@@ -74,9 +71,6 @@ target_sources(${PROJECT_NAME} PRIVATE
 target_include_directories(${PROJECT_NAME} PRIVATE 
     include
     ${CMAKE_CURRENT_BINARY_DIR}
-    ${SDL2IMAGE_INCLUDE_DIR}
-    ${SDL2MIXER_INCLUDE_DIR}
-    ${SDL2TTF_INCLUDE_DIR}
 )
 
 # Add compiler errors/warnings flags
@@ -88,4 +82,4 @@ else()
     target_compile_options(${PROJECT_NAME} PRIVATE -Wall)
 endif()
 
-target_link_libraries(${PROJECT_NAME} SDL2 ${SDL2IMAGE_LIBRARY} ${SDL2MIXER_LIBRARY} ${SDL2TTF_LIBRARY})
+target_link_libraries(${PROJECT_NAME} SDL2)
