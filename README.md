@@ -235,3 +235,7 @@ SDL2.
 
 The decompilation and the SDL2 source port this fork is based on don't state a license, and this
 fork doesn't add one either. SkiFree and its graphics are by Chris Pirih.
+
+## AI-Assisted
+
+Claude Opus 5.5 was used to write parts of the code and to speed up debugging and optimization.
