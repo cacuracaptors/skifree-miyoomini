@@ -233,8 +233,12 @@ SDL2.
 
 ## License
 
-The decompilation and the SDL2 source port this fork is based on don't state a license, and this
-fork doesn't add one either. SkiFree and its graphics are by Chris Pirih.
+The decompilation and the SDL2 source port this fork is based on don't state a license, so `src/`, `asm/` and the
+rest of their files keep their authors' terms. SkiFree and its graphics are by Chris Pirih.
+
+The code written for the Miyoo Mini port is under the MIT License (see `LICENSE`): `build_miyoomini.sh`,
+`make_release.py`, the scripts and text files in `miyoo/`, and the lines changed for the Miyoo Mini in
+`src/skifree_decomp.c` (that file as a whole keeps the terms of the projects it comes from).
 
 ## AI-Assisted
 
